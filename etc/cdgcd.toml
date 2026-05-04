@@ -1,16 +1,15 @@
 # Coredump allow-list GC daemon
 #
-# Dumps whose process name matches `allow_process_name` (glob), or whose
-# recorded executable path matches `allow_executable_path` (glob), are
-# kept. Everything else in `coredump_directory` that is at least
-# `minimum_age` old is unlinked.
+# Each [rules.<name>] section is a match condition. A dump is kept if it
+# matches the FIRST rule (in source order). If no rule matches, the dump
+# is unlinked.
+#
+# Within a field, items are OR (any can match). Fields combine with AND
+# (all must match). Field values that are globs use shell-style globbing.
 #
 # `process_name` is the kernel's TASK_COMM_LEN-truncated name (15 bytes).
-# Don't write `allow_process_name` patterns longer than 15 chars or they
-# will never match.
-
-# allow_process_name = ["myapp", "worker*"]
-# allow_executable_path = ["/opt/foo/bin/*", "/usr/local/bin/bar"]
+# Don't write `process_name` patterns longer than 15 chars or they will
+# never match.
 
 # Where systemd-coredump stores dumps. Default matches upstream config.
 # coredump_directory = "/var/lib/systemd/coredump"
@@ -24,3 +23,33 @@
 
 # Print decisions but don't unlink anything.
 # dry_run = false
+
+# Uppercase rule names are reserved. DEFAULT is the only one supported now;
+# its fields are merged into every other rule where that rule's own field
+# is empty (or, for keep_count, where the rule's keep_count is unset).
+#[rules.DEFAULT]
+#user_id = [1000]
+#keep_count = 50
+
+# Available rule fields:
+#   process_name      Glob over the process name (kernel `comm`, max 15 bytes)
+#   executable_path   Glob over the absolute exe path (from journal)
+#   command_line      Glob over the full cmdline (from journal)
+#   signal            Exact match on signal name, e.g. "SIGSEGV" (from journal)
+#   user_id           Numeric uid filter
+#   user_name         User name filter (resolved to uid at config load time)
+#   keep_count        Keep this many newest dumps; older matching ones are unlinked
+
+# Examples (commented; uncomment and edit):
+
+#[rules.myapp]
+#process_name = ["myapp"]
+#keep_count = 10
+
+#[rules.workers]
+#executable_path = ["/opt/workers/*"]
+#keep_count = 5
+
+#[rules.crashes_only]
+#signal = ["SIGSEGV", "SIGABRT", "SIGBUS"]
+#keep_count = 100

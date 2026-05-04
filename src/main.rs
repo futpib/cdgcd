@@ -15,7 +15,7 @@ use log::{error, warn};
 
 use crate::config::Config;
 use crate::dump::{CoredumpFile, ParseError};
-use crate::policy::{Decision, Policy};
+use crate::policy::Policy;
 use crate::scan::Scanner;
 
 #[derive(Parser, Debug)]
@@ -61,13 +61,13 @@ fn main() -> ExitCode {
 
 fn cmd_run(configuration_file: &Path) -> std::io::Result<ExitCode> {
     let config = load_config(configuration_file)?;
-    if !has_rules(&config) {
+    if config.rules.is_empty() {
         warn!(
-            "no allow_process_name or allow_executable_path rules in {}; daemon would delete every dump",
+            "no rules in {}; daemon would delete every dump",
             configuration_file.display()
         );
         return Err(std::io::Error::other(
-            "refusing to run with no allow rules; set allow_process_name or allow_executable_path in configuration",
+            "refusing to run with no rules; define at least one [rules.<name>] section",
         ));
     }
     daemon::run(configuration_file.to_path_buf())?;
@@ -109,6 +109,7 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
     let policy = build_policy(&config)?;
     let now = SystemTime::now();
 
+    let mut classified: Vec<(CoredumpFile, Option<usize>)> = Vec::new();
     let entries = std::fs::read_dir(&config.coredump_directory)?;
     for entry in entries {
         let entry = match entry {
@@ -123,7 +124,7 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
             Ok(d) => d,
             Err(ParseError::NotACoredump) => continue,
             Err(ParseError::BadField(field)) => {
-                println!("{}\tBAD_{}", path.display(), field.to_uppercase());
+                println!("{}\tBAD\tfield={}", path.display(), field);
                 continue;
             }
         };
@@ -141,27 +142,38 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
             );
             continue;
         }
-        let executable_path =
-            if policy.needs_executable_path() && !policy.matches_process_name(&dump.comm) {
-                journal::lookup_executable_path(&dump.path)
-            } else {
-                None
-            };
-        match policy.evaluate(&dump, executable_path.as_deref()) {
-            Decision::Keep(reason) => println!(
-                "{}\tKEEP\tprocess_name={}\texecutable_path={}\treason={:?}",
+        let rule_index = scan::classify(&policy, &dump);
+        classified.push((dump, rule_index));
+    }
+
+    let over_cap = scan::compute_keep_count_excess(&policy, &classified);
+
+    for (i, (dump, rule_index)) in classified.iter().enumerate() {
+        match rule_index {
+            None => println!(
+                "{}\tREMOVE\tprocess_name={}\treason=NoRuleMatched",
                 dump.path.display(),
-                dump.comm,
-                executable_path.as_deref().unwrap_or("?"),
-                reason
+                dump.comm
             ),
-            Decision::Remove(reason) => println!(
-                "{}\tREMOVE\tprocess_name={}\texecutable_path={}\treason={:?}",
-                dump.path.display(),
-                dump.comm,
-                executable_path.as_deref().unwrap_or("?"),
-                reason
-            ),
+            Some(idx) => {
+                let rule = &policy.rules[*idx];
+                if over_cap.contains(&i) {
+                    println!(
+                        "{}\tREMOVE\tprocess_name={}\treason=KeepCountExceeded\trule={}\tkeep_count={}",
+                        dump.path.display(),
+                        dump.comm,
+                        rule.name,
+                        rule.keep_count.unwrap_or(0)
+                    );
+                } else {
+                    println!(
+                        "{}\tKEEP\tprocess_name={}\trule={}",
+                        dump.path.display(),
+                        dump.comm,
+                        rule.name
+                    );
+                }
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -172,10 +184,5 @@ fn load_config(path: &Path) -> std::io::Result<Config> {
 }
 
 fn build_policy(config: &Config) -> std::io::Result<Policy> {
-    Policy::from_config(config)
-        .map_err(|e| std::io::Error::other(format!("invalid pattern: {}", e)))
-}
-
-fn has_rules(config: &Config) -> bool {
-    !config.allow_process_name.is_empty() || !config.allow_executable_path.is_empty()
+    Policy::from_config(config).map_err(std::io::Error::other)
 }
