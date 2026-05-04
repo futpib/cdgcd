@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -25,6 +25,13 @@ pub enum RemoveReason {
 pub struct DumpVerdict {
     pub dump: CoredumpFile,
     pub verdict: Verdict,
+}
+
+#[derive(Debug)]
+pub struct Classified {
+    pub dump: CoredumpFile,
+    pub rule_index: Option<usize>,
+    pub journal_context: JournalContext,
 }
 
 #[derive(Debug, Default)]
@@ -57,7 +64,7 @@ impl<'a> Scanner<'a> {
         };
 
         let now = SystemTime::now();
-        let mut classified: Vec<(CoredumpFile, Option<usize>)> = Vec::new();
+        let mut classified: Vec<Classified> = Vec::new();
 
         for entry in entries {
             let entry = match entry {
@@ -100,14 +107,18 @@ impl<'a> Scanner<'a> {
                 continue;
             }
 
-            let rule_index = classify(self.policy, &dump);
-            classified.push((dump, rule_index));
+            let (rule_index, journal_context) = classify(self.policy, &dump);
+            classified.push(Classified {
+                dump,
+                rule_index,
+                journal_context,
+            });
         }
 
         let over_cap = compute_keep_count_excess(self.policy, &classified);
 
-        for (i, (dump, rule_index)) in classified.into_iter().enumerate() {
-            let verdict = match rule_index {
+        for (i, c) in classified.into_iter().enumerate() {
+            let verdict = match c.rule_index {
                 None => Verdict::Remove(RemoveReason::NoRuleMatched),
                 Some(idx) => {
                     let rule = &self.policy.rules[idx];
@@ -124,7 +135,7 @@ impl<'a> Scanner<'a> {
                 }
             };
 
-            self.apply(dump, verdict, &mut report);
+            self.apply(c.dump, verdict, &mut report);
         }
 
         report
@@ -157,7 +168,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-pub fn classify(policy: &Policy, dump: &CoredumpFile) -> Option<usize> {
+pub fn classify(policy: &Policy, dump: &CoredumpFile) -> (Option<usize>, JournalContext) {
     let empty = JournalContext::default();
     let mut cache: Option<JournalContext> = None;
     for (idx, rule) in policy.rules.iter().enumerate() {
@@ -166,33 +177,62 @@ pub fn classify(policy: &Policy, dump: &CoredumpFile) -> Option<usize> {
         }
         let ctx = cache.as_ref().unwrap_or(&empty);
         if rule.matches(dump, ctx) {
-            return Some(idx);
+            return (Some(idx), cache.unwrap_or_default());
         }
     }
-    None
+    (None, cache.unwrap_or_default())
 }
 
-pub fn compute_keep_count_excess(
-    policy: &Policy,
-    classified: &[(CoredumpFile, Option<usize>)],
-) -> HashSet<usize> {
+pub fn compute_keep_count_excess(policy: &Policy, classified: &[Classified]) -> HashSet<usize> {
     let mut over_cap = HashSet::new();
     for (rule_idx, rule) in policy.rules.iter().enumerate() {
         let cap = match rule.keep_count {
             Some(n) => n as usize,
             None => continue,
         };
-        let mut matching: Vec<usize> = classified
+        let matching: Vec<usize> = classified
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, ri))| if *ri == Some(rule_idx) { Some(i) } else { None })
+            .filter_map(|(i, c)| {
+                if c.rule_index == Some(rule_idx) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .collect();
-        matching.sort_by_key(|&i| std::cmp::Reverse(classified[i].0.timestamp_micros));
-        for &i in matching.iter().skip(cap) {
-            over_cap.insert(i);
+
+        if rule.group_by.is_empty() {
+            mark_excess(&matching, classified, cap, &mut over_cap);
+        } else {
+            let mut groups: HashMap<Vec<Option<String>>, Vec<usize>> = HashMap::new();
+            for i in matching {
+                let key: Vec<Option<String>> = rule
+                    .group_by
+                    .iter()
+                    .map(|f| f.extract(&classified[i].dump, &classified[i].journal_context))
+                    .collect();
+                groups.entry(key).or_default().push(i);
+            }
+            for (_, group) in groups {
+                mark_excess(&group, classified, cap, &mut over_cap);
+            }
         }
     }
     over_cap
+}
+
+fn mark_excess(
+    indices: &[usize],
+    classified: &[Classified],
+    cap: usize,
+    over_cap: &mut HashSet<usize>,
+) {
+    let mut sorted = indices.to_vec();
+    sorted.sort_by_key(|&i| std::cmp::Reverse(classified[i].dump.timestamp_micros));
+    for &i in sorted.iter().skip(cap) {
+        over_cap.insert(i);
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +251,14 @@ mod tests {
             pid: 1,
             timestamp_micros: ts,
             extension: None,
+        }
+    }
+
+    fn classified_at(comm: &str, ts: u64, rule_index: Option<usize>) -> Classified {
+        Classified {
+            dump: dump_at(comm, ts),
+            rule_index,
+            journal_context: JournalContext::default(),
         }
     }
 
@@ -240,17 +288,16 @@ mod tests {
         let cfg = config(vec![rule_keeping("foo", "foo", Some(2))]);
         let policy = Policy::from_config(&cfg).unwrap();
         let classified = vec![
-            (dump_at("foo", 100), Some(0)),
-            (dump_at("foo", 200), Some(0)),
-            (dump_at("foo", 300), Some(0)),
-            (dump_at("foo", 50), Some(0)),
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
+            classified_at("foo", 300, Some(0)),
+            classified_at("foo", 50, Some(0)),
         ];
         let over_cap = compute_keep_count_excess(&policy, &classified);
-        // newest two (300, 200) survive; 100 and 50 get capped
-        assert!(!over_cap.contains(&1)); // ts=200
-        assert!(!over_cap.contains(&2)); // ts=300
-        assert!(over_cap.contains(&0)); // ts=100
-        assert!(over_cap.contains(&3)); // ts=50
+        assert!(!over_cap.contains(&1));
+        assert!(!over_cap.contains(&2));
+        assert!(over_cap.contains(&0));
+        assert!(over_cap.contains(&3));
     }
 
     #[test]
@@ -258,8 +305,8 @@ mod tests {
         let cfg = config(vec![rule_keeping("foo", "foo", None)]);
         let policy = Policy::from_config(&cfg).unwrap();
         let classified = vec![
-            (dump_at("foo", 100), Some(0)),
-            (dump_at("foo", 200), Some(0)),
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
         ];
         let over_cap = compute_keep_count_excess(&policy, &classified);
         assert!(over_cap.is_empty());
@@ -273,19 +320,72 @@ mod tests {
         ]);
         let policy = Policy::from_config(&cfg).unwrap();
         let classified = vec![
-            (dump_at("foo", 100), Some(0)),
-            (dump_at("foo", 200), Some(0)),
-            (dump_at("bar", 50), Some(1)),
-            (dump_at("bar", 60), Some(1)),
-            (dump_at("bar", 70), Some(1)),
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
+            classified_at("bar", 50, Some(1)),
+            classified_at("bar", 60, Some(1)),
+            classified_at("bar", 70, Some(1)),
         ];
         let over_cap = compute_keep_count_excess(&policy, &classified);
-        // foo: keep 1 newest (ts=200), drop ts=100
-        // bar: keep 2 newest (ts=70, 60), drop ts=50
         assert!(over_cap.contains(&0));
         assert!(!over_cap.contains(&1));
         assert!(over_cap.contains(&2));
         assert!(!over_cap.contains(&3));
         assert!(!over_cap.contains(&4));
+    }
+
+    #[test]
+    fn group_by_process_name_caps_per_comm() {
+        let rule = NamedRule {
+            name: "user".to_string(),
+            rule: Rule {
+                user_id: vec![0],
+                group_by: vec!["process_name".to_string()],
+                keep_count: Some(2),
+                ..Rule::default()
+            },
+        };
+        let policy = Policy::from_config(&config(vec![rule])).unwrap();
+        let classified = vec![
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
+            classified_at("foo", 300, Some(0)),
+            classified_at("bar", 10, Some(0)),
+            classified_at("bar", 20, Some(0)),
+            classified_at("bar", 30, Some(0)),
+        ];
+        let over_cap = compute_keep_count_excess(&policy, &classified);
+        // foo: keep ts=300, 200, drop ts=100
+        // bar: keep ts=30, 20, drop ts=10
+        assert!(over_cap.contains(&0));
+        assert!(!over_cap.contains(&1));
+        assert!(!over_cap.contains(&2));
+        assert!(over_cap.contains(&3));
+        assert!(!over_cap.contains(&4));
+        assert!(!over_cap.contains(&5));
+    }
+
+    #[test]
+    fn group_by_multi_field_uses_tuple() {
+        let rule = NamedRule {
+            name: "by_user_and_comm".to_string(),
+            rule: Rule {
+                group_by: vec!["process_name".to_string(), "user_id".to_string()],
+                keep_count: Some(1),
+                ..Rule::default()
+            },
+        };
+        let policy = Policy::from_config(&config(vec![rule])).unwrap();
+        let mut classified = vec![
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
+            classified_at("foo", 300, Some(0)),
+        ];
+        // Same comm, different uids — should each survive (different group key)
+        classified[0].dump.uid = 1;
+        classified[1].dump.uid = 2;
+        classified[2].dump.uid = 3;
+        let over_cap = compute_keep_count_excess(&policy, &classified);
+        assert!(over_cap.is_empty(), "different uids form different groups");
     }
 }

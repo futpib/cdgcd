@@ -27,6 +27,7 @@ pub struct Rule {
     pub signal: Vec<String>,
     pub user_id: Vec<u32>,
     pub user_name: Vec<String>,
+    pub group_by: Vec<String>,
     pub keep_count: Option<u32>,
 }
 
@@ -45,7 +46,17 @@ const RULE_KEYS: &[&str] = &[
     "signal",
     "user_id",
     "user_name",
+    "group_by",
     "keep_count",
+];
+
+pub const GROUP_BY_FIELDS: &[&str] = &[
+    "process_name",
+    "executable_path",
+    "command_line",
+    "signal",
+    "user_id",
+    "boot_id",
 ];
 
 const DEFAULT_RULE_NAME: &str = "DEFAULT";
@@ -123,6 +134,7 @@ impl Rule {
             signal: pick(self.signal, &default.signal),
             user_id: pick_u32(self.user_id, &default.user_id),
             user_name: pick(self.user_name, &default.user_name),
+            group_by: pick(self.group_by, &default.group_by),
             keep_count: self.keep_count.or(default.keep_count),
         }
     }
@@ -161,6 +173,16 @@ fn pick_u32(own: Vec<u32>, default: &[u32]) -> Vec<u32> {
 
 fn parse_rule(table: &Table) -> Result<Rule, String> {
     check_known(table, RULE_KEYS, "rule")?;
+    let group_by = parse_string_vec(table, "group_by")?;
+    for field in &group_by {
+        if !GROUP_BY_FIELDS.contains(&field.as_str()) {
+            return Err(format!(
+                "group_by: unknown field {:?} (allowed: {})",
+                field,
+                GROUP_BY_FIELDS.join(", ")
+            ));
+        }
+    }
     Ok(Rule {
         process_name: parse_string_vec(table, "process_name")?,
         executable_path: parse_string_vec(table, "executable_path")?,
@@ -168,6 +190,7 @@ fn parse_rule(table: &Table) -> Result<Rule, String> {
         signal: parse_string_vec(table, "signal")?,
         user_id: parse_u32_vec(table, "user_id")?,
         user_name: parse_string_vec(table, "user_name")?,
+        group_by,
         keep_count: parse_u32(table, "keep_count")?,
     })
 }
@@ -361,6 +384,29 @@ keep_count = 1
     #[test]
     fn rejects_unknown_rule_field() {
         assert!(Config::parse("[rules.foo]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn group_by_field_must_be_known() {
+        let err = Config::parse("[rules.foo]\ngroup_by = [\"bogus\"]\n").unwrap_err();
+        assert!(err.contains("group_by"));
+    }
+
+    #[test]
+    fn group_by_inherits_from_default() {
+        let cfg = Config::parse(
+            r#"
+[rules.DEFAULT]
+group_by = ["process_name"]
+keep_count = 3
+
+[rules.foo]
+process_name = ["foo"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rules[0].rule.group_by, vec!["process_name".to_string()]);
+        assert_eq!(cfg.rules[0].rule.keep_count, Some(3));
     }
 
     #[test]

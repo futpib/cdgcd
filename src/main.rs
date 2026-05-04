@@ -16,7 +16,7 @@ use log::{error, warn};
 use crate::config::Config;
 use crate::dump::{CoredumpFile, ParseError};
 use crate::policy::Policy;
-use crate::scan::Scanner;
+use crate::scan::{Classified, Scanner};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -109,7 +109,7 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
     let policy = build_policy(&config)?;
     let now = SystemTime::now();
 
-    let mut classified: Vec<(CoredumpFile, Option<usize>)> = Vec::new();
+    let mut classified: Vec<Classified> = Vec::new();
     let entries = std::fs::read_dir(&config.coredump_directory)?;
     for entry in entries {
         let entry = match entry {
@@ -142,34 +142,38 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
             );
             continue;
         }
-        let rule_index = scan::classify(&policy, &dump);
-        classified.push((dump, rule_index));
+        let (rule_index, journal_context) = scan::classify(&policy, &dump);
+        classified.push(Classified {
+            dump,
+            rule_index,
+            journal_context,
+        });
     }
 
     let over_cap = scan::compute_keep_count_excess(&policy, &classified);
 
-    for (i, (dump, rule_index)) in classified.iter().enumerate() {
-        match rule_index {
+    for (i, c) in classified.iter().enumerate() {
+        match c.rule_index {
             None => println!(
                 "{}\tREMOVE\tprocess_name={}\treason=NoRuleMatched",
-                dump.path.display(),
-                dump.comm
+                c.dump.path.display(),
+                c.dump.comm
             ),
             Some(idx) => {
-                let rule = &policy.rules[*idx];
+                let rule = &policy.rules[idx];
                 if over_cap.contains(&i) {
                     println!(
                         "{}\tREMOVE\tprocess_name={}\treason=KeepCountExceeded\trule={}\tkeep_count={}",
-                        dump.path.display(),
-                        dump.comm,
+                        c.dump.path.display(),
+                        c.dump.comm,
                         rule.name,
                         rule.keep_count.unwrap_or(0)
                     );
                 } else {
                     println!(
                         "{}\tKEEP\tprocess_name={}\trule={}",
-                        dump.path.display(),
-                        dump.comm,
+                        c.dump.path.display(),
+                        c.dump.comm,
                         rule.name
                     );
                 }

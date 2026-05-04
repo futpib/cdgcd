@@ -24,12 +24,15 @@
 # Print decisions but don't unlink anything.
 # dry_run = false
 
-# Uppercase rule names are reserved. DEFAULT is the only one supported now;
-# its fields are merged into every other rule where that rule's own field
-# is empty (or, for keep_count, where the rule's keep_count is unset).
-#[rules.DEFAULT]
-#user_id = [1000]
-#keep_count = 50
+# Uppercase rule names are reserved. DEFAULT is a template — its fields
+# are merged into every other rule where that rule's own field is empty
+# (or, for keep_count, where the rule's keep_count is unset). DEFAULT
+# itself is never evaluated as a rule, so it cannot keep dumps on its own.
+[rules.DEFAULT]
+# Bucket each rule's keep_count by process name, so one flapping process
+# can't eat the whole rule's quota and starve its neighbors.
+group_by = ["process_name"]
+keep_count = 3
 
 # Available rule fields:
 #   process_name      Glob over the process name (kernel `comm`, max 15 bytes)
@@ -38,18 +41,23 @@
 #   signal            Exact match on signal name, e.g. "SIGSEGV" (from journal)
 #   user_id           Numeric uid filter
 #   user_name         User name filter (resolved to uid at config load time)
-#   keep_count        Keep this many newest dumps; older matching ones are unlinked
+#   group_by          List of fields to bucket keep_count by; available:
+#                     process_name, user_id, executable_path, command_line,
+#                     signal, boot_id
+#   keep_count        Keep this many newest dumps (per group_by bucket if set)
 
 # Examples (commented; uncomment and edit):
 
 #[rules.myapp]
 #process_name = ["myapp"]
-#keep_count = 10
+#keep_count = 10            # rule-wide cap, no grouping override
 
 #[rules.workers]
 #executable_path = ["/opt/workers/*"]
-#keep_count = 5
+#group_by = ["executable_path"]
+#keep_count = 5             # 5 newest per distinct exe path
 
 #[rules.crashes_only]
 #signal = ["SIGSEGV", "SIGABRT", "SIGBUS"]
-#keep_count = 100
+#group_by = ["process_name", "signal"]
+#keep_count = 5            # 5 newest per (process_name, signal) bucket

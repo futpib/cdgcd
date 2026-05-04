@@ -15,15 +15,59 @@ pub struct CompiledRule {
     pub command_line: Vec<glob::Pattern>,
     pub signal: Vec<String>,
     pub user_ids: Vec<u32>,
+    pub group_by: Vec<GroupField>,
     pub keep_count: Option<u32>,
     pub needs_journal: bool,
     pub is_unconstrained: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupField {
+    ProcessName,
+    UserId,
+    ExecutablePath,
+    CommandLine,
+    Signal,
+    BootId,
+}
+
+impl GroupField {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "process_name" => Self::ProcessName,
+            "user_id" => Self::UserId,
+            "executable_path" => Self::ExecutablePath,
+            "command_line" => Self::CommandLine,
+            "signal" => Self::Signal,
+            "boot_id" => Self::BootId,
+            _ => return None,
+        })
+    }
+
+    fn needs_journal(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutablePath | Self::CommandLine | Self::Signal
+        )
+    }
+
+    pub fn extract(&self, dump: &CoredumpFile, context: &JournalContext) -> Option<String> {
+        match self {
+            Self::ProcessName => Some(dump.comm.clone()),
+            Self::UserId => Some(dump.uid.to_string()),
+            Self::ExecutablePath => context.executable_path.clone(),
+            Self::CommandLine => context.command_line.clone(),
+            Self::Signal => context.signal.clone(),
+            Self::BootId => Some(dump.boot_id.clone()),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum PolicyError {
     Pattern(glob::PatternError),
     UnknownUser(String),
+    UnknownGroupField(String),
 }
 
 impl std::fmt::Display for PolicyError {
@@ -31,6 +75,7 @@ impl std::fmt::Display for PolicyError {
         match self {
             PolicyError::Pattern(e) => write!(f, "invalid glob: {}", e),
             PolicyError::UnknownUser(name) => write!(f, "unknown user: {}", name),
+            PolicyError::UnknownGroupField(name) => write!(f, "unknown group_by field: {}", name),
         }
     }
 }
@@ -79,9 +124,17 @@ impl CompiledRule {
         user_ids.sort_unstable();
         user_ids.dedup();
 
+        let mut group_by = Vec::with_capacity(rule.group_by.len());
+        for field in &rule.group_by {
+            group_by.push(
+                GroupField::parse(field).ok_or_else(|| PolicyError::UnknownGroupField(field.clone()))?,
+            );
+        }
+
         let needs_journal = !executable_path.is_empty()
             || !command_line.is_empty()
-            || !rule.signal.is_empty();
+            || !rule.signal.is_empty()
+            || group_by.iter().any(|f| f.needs_journal());
 
         Ok(CompiledRule {
             name: name.to_string(),
@@ -90,6 +143,7 @@ impl CompiledRule {
             command_line,
             signal: rule.signal.clone(),
             user_ids,
+            group_by,
             keep_count: rule.keep_count,
             needs_journal,
             is_unconstrained: rule.is_empty(),
