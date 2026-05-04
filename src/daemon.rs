@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use inotify::{Inotify, WatchMask};
 use log::{debug, error, info, warn};
@@ -91,10 +92,14 @@ pub fn run(config_path: PathBuf) -> std::io::Result<()> {
 
     drop(tx);
 
+    let watchdog_interval = sd::watchdog_interval();
+    let mut last_scan = Instant::now();
+
     loop {
-        let event = match rx.recv_timeout(config.idle_interval) {
-            Ok(e) => e,
-            Err(mpsc::RecvTimeoutError::Timeout) => Event::ScanNow,
+        let timeout = next_wakeup(config.idle_interval, last_scan, watchdog_interval);
+        let event = match rx.recv_timeout(timeout) {
+            Ok(e) => Some(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 warn!("event channel closed; exiting");
                 break;
@@ -104,12 +109,12 @@ pub fn run(config_path: PathBuf) -> std::io::Result<()> {
         sd::watchdog();
 
         match event {
-            Event::Term => {
+            Some(Event::Term) => {
                 info!("shutting down");
                 sd::stopping();
                 break;
             }
-            Event::Reload => {
+            Some(Event::Reload) => {
                 info!("reloading config from {}", config_path.display());
                 match Config::load(&config_path) {
                     Ok(new) => match Policy::from_config(&new) {
@@ -129,23 +134,48 @@ pub fn run(config_path: PathBuf) -> std::io::Result<()> {
                     Err(e) => error!("reload failed: {}", e),
                 }
             }
-            Event::Inotify | Event::ScanNow => {
+            Some(Event::Inotify) | Some(Event::ScanNow) => {
                 let report = Scanner {
                     config: &config,
                     policy: &policy,
                 }
                 .scan();
                 log_report(&report);
+                last_scan = Instant::now();
             }
-            Event::InotifyFailed => {
+            Some(Event::InotifyFailed) => {
                 error!("inotify thread exited; daemon cannot continue without it");
                 sd::stopping();
                 return Err(std::io::Error::other("inotify thread failed"));
+            }
+            None => {
+                if last_scan.elapsed() >= config.idle_interval {
+                    let report = Scanner {
+                        config: &config,
+                        policy: &policy,
+                    }
+                    .scan();
+                    log_report(&report);
+                    last_scan = Instant::now();
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn next_wakeup(
+    idle_interval: Duration,
+    last_scan: Instant,
+    watchdog_interval: Option<Duration>,
+) -> Duration {
+    let until_scan = idle_interval.saturating_sub(last_scan.elapsed());
+    let candidate = match watchdog_interval {
+        Some(wd) => wd.min(until_scan),
+        None => until_scan,
+    };
+    candidate.max(Duration::from_millis(100))
 }
 
 fn load_or_die(path: &Path) -> std::io::Result<Config> {
