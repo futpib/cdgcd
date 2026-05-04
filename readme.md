@@ -59,7 +59,7 @@ Available rule fields:
 
 | field             | source       | notes                                           |
 | ----------------- | ------------ | ----------------------------------------------- |
-| `process_name`    | filename     | kernel `comm`, max 15 bytes — keep globs short  |
+| `process_name`    | filename     | kernel `comm`, max 15 bytes (see below)         |
 | `executable_path` | journal      | full path to the binary                         |
 | `command_line`    | journal      | full cmdline                                    |
 | `signal`          | journal      | signal name, e.g. `"SIGSEGV"`                   |
@@ -67,6 +67,15 @@ Available rule fields:
 | `user_name`       | passwd       | resolved to uid at config load                  |
 | `group_by`        | —            | bucket `keep_count` by tuple of these fields    |
 | `keep_count`      | —            | keep N newest per bucket (or per rule if no group_by) |
+
+`process_name` matches the kernel's `comm` field. The kernel allocates
+`TASK_COMM_LEN` (16) bytes for it in `task_struct` (see
+`include/linux/sched.h`); one byte is reserved for the trailing NUL,
+so what `/proc/PID/comm` (and therefore the systemd-coredump filename)
+actually exposes is at most 15 bytes. A `process_name` glob whose
+literal portion already exceeds 15 bytes can never match — cdgcd
+refuses such patterns at config load rather than silently never
+firing.
 
 Top-level fields: `coredump_directory`, `idle_interval`, `minimum_age`,
 `dry_run`. Defaults are sensible; see `etc/cdgcd.toml`.

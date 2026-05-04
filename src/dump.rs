@@ -1,5 +1,13 @@
 use std::path::{Path, PathBuf};
 
+/// Maximum printable length of a process name as captured by the kernel.
+///
+/// `/proc/PID/comm` is truncated to `TASK_COMM_LEN - 1` bytes; on Linux
+/// `TASK_COMM_LEN` is 16 (one byte reserved for the trailing NUL — see
+/// `include/linux/sched.h`), so the comm value that ends up in the
+/// systemd-coredump filename is at most 15 bytes.
+pub const COMM_MAX_LEN: usize = 15;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoredumpFile {
     pub path: PathBuf,

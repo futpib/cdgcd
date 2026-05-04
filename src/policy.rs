@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::dump::CoredumpFile;
+use crate::dump::{COMM_MAX_LEN, CoredumpFile};
 use crate::journal::JournalContext;
 
 #[derive(Debug)]
@@ -68,6 +68,11 @@ pub enum PolicyError {
     Pattern(glob::PatternError),
     UnknownUser(String),
     UnknownGroupField(String),
+    ProcessNameTooLong {
+        rule_name: String,
+        pattern: String,
+        min_length: usize,
+    },
 }
 
 impl std::fmt::Display for PolicyError {
@@ -76,6 +81,16 @@ impl std::fmt::Display for PolicyError {
             PolicyError::Pattern(e) => write!(f, "invalid glob: {}", e),
             PolicyError::UnknownUser(name) => write!(f, "unknown user: {}", name),
             PolicyError::UnknownGroupField(name) => write!(f, "unknown group_by field: {}", name),
+            PolicyError::ProcessNameTooLong {
+                rule_name,
+                pattern,
+                min_length,
+            } => write!(
+                f,
+                "rule {} process_name pattern {:?} needs at least {} chars to match, \
+                 but the kernel truncates `comm` to {} bytes — this pattern can never match",
+                rule_name, pattern, min_length, COMM_MAX_LEN,
+            ),
         }
     }
 }
@@ -112,6 +127,16 @@ impl Policy {
 
 impl CompiledRule {
     fn from_rule(name: &str, rule: &crate::config::Rule) -> Result<Self, PolicyError> {
+        for pattern in &rule.process_name {
+            let min = glob_min_match_length(pattern);
+            if min > COMM_MAX_LEN {
+                return Err(PolicyError::ProcessNameTooLong {
+                    rule_name: name.to_string(),
+                    pattern: pattern.clone(),
+                    min_length: min,
+                });
+            }
+        }
         let process_name = compile_globs(&rule.process_name)?;
         let executable_path = compile_globs(&rule.executable_path)?;
         let command_line = compile_globs(&rule.command_line)?;
@@ -195,6 +220,35 @@ impl CompiledRule {
 
 fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, glob::PatternError> {
     patterns.iter().map(|p| glob::Pattern::new(p)).collect()
+}
+
+/// Minimum number of input characters a glob pattern must consume to match.
+/// `*` contributes 0; `?` and character classes contribute 1; literals
+/// contribute 1; `\<x>` is one literal character.
+fn glob_min_match_length(pattern: &str) -> usize {
+    let mut count = 0;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {}
+            '?' => count += 1,
+            '\\' => {
+                if chars.next().is_some() {
+                    count += 1;
+                }
+            }
+            '[' => {
+                count += 1;
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => count += 1,
+        }
+    }
+    count
 }
 
 fn resolve_user_name(name: &str) -> Option<u32> {
@@ -323,6 +377,41 @@ mod tests {
         r.rule.user_name = vec!["root".into()];
         let p = Policy::from_config(&config_with(vec![r])).unwrap();
         assert!(p.rules[0].user_ids.contains(&0));
+    }
+
+    #[test]
+    fn glob_min_match_length_basics() {
+        assert_eq!(glob_min_match_length("myapp"), 5);
+        assert_eq!(glob_min_match_length("my*"), 2);
+        assert_eq!(glob_min_match_length("*app"), 3);
+        assert_eq!(glob_min_match_length("my?"), 3);
+        assert_eq!(glob_min_match_length("my[xyz]"), 3);
+        assert_eq!(glob_min_match_length("my\\*"), 3);
+        assert_eq!(glob_min_match_length("a*b*c*d"), 4);
+    }
+
+    #[test]
+    fn over_long_process_name_is_rejected() {
+        let mut r = rule("too-long");
+        r.rule.process_name = vec!["this-name-is-definitely-too-long".to_string()];
+        let err = Policy::from_config(&config_with(vec![r])).unwrap_err();
+        assert!(matches!(err, PolicyError::ProcessNameTooLong { .. }));
+    }
+
+    #[test]
+    fn over_long_with_trailing_wildcard_still_rejected() {
+        let mut r = rule("prefix-long");
+        // 22 literal chars + "*" — the literal prefix alone exceeds 15
+        r.rule.process_name = vec!["gnome-shell-extension-*".to_string()];
+        let err = Policy::from_config(&config_with(vec![r])).unwrap_err();
+        assert!(matches!(err, PolicyError::ProcessNameTooLong { .. }));
+    }
+
+    #[test]
+    fn fifteen_char_pattern_is_accepted() {
+        let mut r = rule("at-limit");
+        r.rule.process_name = vec!["a".repeat(15)];
+        assert!(Policy::from_config(&config_with(vec![r])).is_ok());
     }
 
     #[test]
