@@ -14,6 +14,8 @@ them.
 
 ## Install
 
+Arch Linux: https://aur.archlinux.org/packages/cdgcd-git
+
 From source:
 
 ```bash
@@ -34,10 +36,14 @@ sudo systemctl enable --now cdgcd
 in source order; an unmatched dump is unlinked. Within a field, items
 are OR; fields combine with AND.
 
+`[rules.DEFAULT]` is special: its fields are merged as defaults into
+every named rule, and DEFAULT itself is evaluated as the LAST rule
+— a catch-all so the daemon is runnable with just DEFAULT defined.
+
 ```toml
 [rules.DEFAULT]
 group_by   = ["process_name"]   # bucket the cap below per comm
-keep_count = 3                  # 3 newest per process (inherited by every rule)
+keep_count = 3                  # inherited by every rule, and the catch-all itself
 
 [rules.firefox]
 process_name = ["firefox", "firefox-bin"]

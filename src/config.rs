@@ -86,6 +86,7 @@ impl Config {
 
         let mut rules = Vec::new();
         let mut default_rule = Rule::default();
+        let mut has_default = false;
 
         if let Some(rules_value) = table.get("rules") {
             let rules_table = rules_value
@@ -97,6 +98,7 @@ impl Config {
                     .ok_or_else(|| "rules.DEFAULT must be a table".to_string())?;
                 default_rule = parse_rule(default_table)
                     .map_err(|e| format!("rules.DEFAULT: {}", e))?;
+                has_default = true;
             }
             for (name, rule_value) in rules_table {
                 if name == DEFAULT_RULE_NAME {
@@ -113,6 +115,13 @@ impl Config {
                     rule,
                 });
             }
+        }
+
+        if has_default {
+            rules.push(NamedRule {
+                name: DEFAULT_RULE_NAME.to_string(),
+                rule: default_rule,
+            });
         }
 
         Ok(Config {
@@ -407,6 +416,50 @@ process_name = ["foo"]
         .unwrap();
         assert_eq!(cfg.rules[0].rule.group_by, vec!["process_name".to_string()]);
         assert_eq!(cfg.rules[0].rule.keep_count, Some(3));
+    }
+
+    #[test]
+    fn default_section_is_appended_as_a_catch_all_rule() {
+        let cfg = Config::parse(
+            r#"
+[rules.DEFAULT]
+keep_count = 5
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].name, "DEFAULT");
+        assert_eq!(cfg.rules[0].rule.keep_count, Some(5));
+    }
+
+    #[test]
+    fn default_appended_after_named_rules() {
+        let cfg = Config::parse(
+            r#"
+[rules.DEFAULT]
+keep_count = 5
+
+[rules.specific]
+process_name = ["foo"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[0].name, "specific");
+        assert_eq!(cfg.rules[1].name, "DEFAULT");
+    }
+
+    #[test]
+    fn no_default_section_means_no_catch_all() {
+        let cfg = Config::parse(
+            r#"
+[rules.foo]
+process_name = ["foo"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].name, "foo");
     }
 
     #[test]

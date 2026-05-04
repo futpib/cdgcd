@@ -24,13 +24,14 @@
 # Print decisions but don't unlink anything.
 # dry_run = false
 
-# Uppercase rule names are reserved. DEFAULT is a template — its fields
-# are merged into every other rule where that rule's own field is empty
-# (or, for keep_count, where the rule's keep_count is unset). DEFAULT
-# itself is never evaluated as a rule, so it cannot keep dumps on its own.
+# Uppercase rule names are reserved. DEFAULT pulls double duty: its
+# fields are merged as defaults into every named rule (where that rule
+# left a field empty, or for keep_count where it left it unset), AND
+# DEFAULT itself is evaluated as the LAST rule — a catch-all for dumps
+# that no named rule matched.
 [rules.DEFAULT]
-# Bucket each rule's keep_count by process name, so one flapping process
-# can't eat the whole rule's quota and starve its neighbors.
+# Bucket the catch-all keep_count by process name so one flapping
+# process can't eat the whole quota and starve its neighbors.
 group_by = ["process_name"]
 keep_count = 3
 
