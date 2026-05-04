@@ -1,0 +1,16 @@
+[Unit]
+Description=Coredump allow-list garbage collector
+Documentation=https://github.com/futpib/cdgcd
+After=systemd-coredump.socket
+Wants=systemd-coredump.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cdgcd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5s
+WatchdogSec=30s
+
+[Install]
+WantedBy=multi-user.target
