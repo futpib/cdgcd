@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -8,10 +9,12 @@ use crate::config::Config;
 use crate::dump::{CoredumpFile, ParseError};
 use crate::journal::{self, JournalContext};
 use crate::policy::Policy;
+use crate::retain;
 
 #[derive(Debug, Clone)]
 pub enum Verdict {
     Keep { rule_name: String },
+    KeepRetained,
     Remove(RemoveReason),
 }
 
@@ -32,6 +35,7 @@ pub struct Classified {
     pub dump: CoredumpFile,
     pub rule_index: Option<usize>,
     pub journal_context: JournalContext,
+    pub retained: bool,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +69,8 @@ impl<'a> Scanner<'a> {
 
         let now = SystemTime::now();
         let mut classified: Vec<Classified> = Vec::new();
+        let mut markers: HashSet<OsString> = HashSet::new();
+        let mut candidate_entries: Vec<std::fs::DirEntry> = Vec::new();
 
         for entry in entries {
             let entry = match entry {
@@ -76,6 +82,14 @@ impl<'a> Scanner<'a> {
                     continue;
                 }
             };
+            if let Some(dump_name) = retain::dump_name_for_marker(&entry.file_name()) {
+                markers.insert(OsString::from(dump_name));
+            } else {
+                candidate_entries.push(entry);
+            }
+        }
+
+        for entry in candidate_entries {
             let path = entry.path();
 
             let dump = match CoredumpFile::from_path(&path) {
@@ -107,29 +121,39 @@ impl<'a> Scanner<'a> {
                 continue;
             }
 
-            let (rule_index, journal_context) = classify(self.policy, &dump);
+            let retained = markers.contains(&entry.file_name());
+            let (rule_index, journal_context) = if retained {
+                (None, JournalContext::default())
+            } else {
+                classify(self.policy, &dump)
+            };
             classified.push(Classified {
                 dump,
                 rule_index,
                 journal_context,
+                retained,
             });
         }
 
         let over_cap = compute_keep_count_excess(self.policy, &classified);
 
         for (i, c) in classified.into_iter().enumerate() {
-            let verdict = match c.rule_index {
-                None => Verdict::Remove(RemoveReason::NoRuleMatched),
-                Some(idx) => {
-                    let rule = &self.policy.rules[idx];
-                    if over_cap.contains(&i) {
-                        Verdict::Remove(RemoveReason::KeepCountExceeded {
-                            rule_name: rule.name.clone(),
-                            keep_count: rule.keep_count.unwrap_or(0),
-                        })
-                    } else {
-                        Verdict::Keep {
-                            rule_name: rule.name.clone(),
+            let verdict = if c.retained {
+                Verdict::KeepRetained
+            } else {
+                match c.rule_index {
+                    None => Verdict::Remove(RemoveReason::NoRuleMatched),
+                    Some(idx) => {
+                        let rule = &self.policy.rules[idx];
+                        if over_cap.contains(&i) {
+                            Verdict::Remove(RemoveReason::KeepCountExceeded {
+                                rule_name: rule.name.clone(),
+                                keep_count: rule.keep_count.unwrap_or(0),
+                            })
+                        } else {
+                            Verdict::Keep {
+                                rule_name: rule.name.clone(),
+                            }
                         }
                     }
                 }
@@ -145,6 +169,10 @@ impl<'a> Scanner<'a> {
         match &verdict {
             Verdict::Keep { rule_name } => {
                 debug!("keep {} (rule {})", dump.path.display(), rule_name);
+                report.kept.push(DumpVerdict { dump, verdict });
+            }
+            Verdict::KeepRetained => {
+                debug!("keep {} (retain marker)", dump.path.display());
                 report.kept.push(DumpVerdict { dump, verdict });
             }
             Verdict::Remove(reason) => {
@@ -194,7 +222,9 @@ pub fn compute_keep_count_excess(policy: &Policy, classified: &[Classified]) -> 
             .iter()
             .enumerate()
             .filter_map(|(i, c)| {
-                if c.rule_index == Some(rule_idx) {
+                if c.retained {
+                    None
+                } else if c.rule_index == Some(rule_idx) {
                     Some(i)
                 } else {
                     None
@@ -259,6 +289,7 @@ mod tests {
             dump: dump_at(comm, ts),
             rule_index,
             journal_context: JournalContext::default(),
+            retained: false,
         }
     }
 
@@ -363,6 +394,24 @@ mod tests {
         assert!(over_cap.contains(&3));
         assert!(!over_cap.contains(&4));
         assert!(!over_cap.contains(&5));
+    }
+
+    #[test]
+    fn retained_dumps_skip_keep_count_cap() {
+        let cfg = config(vec![rule_keeping("foo", "foo", Some(1))]);
+        let policy = Policy::from_config(&cfg).unwrap();
+        let mut classified = vec![
+            classified_at("foo", 100, Some(0)),
+            classified_at("foo", 200, Some(0)),
+            classified_at("foo", 300, Some(0)),
+        ];
+        // pin the oldest — it should not count against the cap, and the newest one wins
+        classified[0].retained = true;
+        let over_cap = compute_keep_count_excess(&policy, &classified);
+        // ts=300 (newest non-retained) survives the cap; ts=200 is over cap
+        assert!(!over_cap.contains(&0), "retained dump never marked over-cap");
+        assert!(over_cap.contains(&1), "ts=200 over cap (cap=1)");
+        assert!(!over_cap.contains(&2), "ts=300 newest survives");
     }
 
     #[test]

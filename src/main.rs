@@ -1,11 +1,3 @@
-pub mod config;
-pub mod daemon;
-pub mod dump;
-pub mod journal;
-pub mod policy;
-pub mod scan;
-pub mod sd;
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -13,10 +5,12 @@ use std::time::SystemTime;
 use clap::{Parser, Subcommand};
 use log::{error, warn};
 
-use crate::config::Config;
-use crate::dump::{CoredumpFile, ParseError};
-use crate::policy::Policy;
-use crate::scan::{Classified, Scanner};
+use cdgcd::config::Config;
+use cdgcd::dump::{CoredumpFile, ParseError};
+use cdgcd::policy::Policy;
+use cdgcd::retain;
+use cdgcd::scan::{self, Classified, Scanner};
+use cdgcd::{daemon, journal};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -110,6 +104,9 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
     let now = SystemTime::now();
 
     let mut classified: Vec<Classified> = Vec::new();
+    let mut markers: std::collections::HashSet<std::ffi::OsString> =
+        std::collections::HashSet::new();
+    let mut candidate_entries: Vec<std::fs::DirEntry> = Vec::new();
     let entries = std::fs::read_dir(&config.coredump_directory)?;
     for entry in entries {
         let entry = match entry {
@@ -119,6 +116,13 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
                 continue;
             }
         };
+        if let Some(name) = retain::dump_name_for_marker(&entry.file_name()) {
+            markers.insert(std::ffi::OsString::from(name));
+        } else {
+            candidate_entries.push(entry);
+        }
+    }
+    for entry in candidate_entries {
         let path = entry.path();
         let dump = match CoredumpFile::from_path(&path) {
             Ok(d) => d,
@@ -142,17 +146,31 @@ fn cmd_check(configuration_file: &Path) -> std::io::Result<ExitCode> {
             );
             continue;
         }
-        let (rule_index, journal_context) = scan::classify(&policy, &dump);
+        let retained = markers.contains(&entry.file_name());
+        let (rule_index, journal_context) = if retained {
+            (None, journal::JournalContext::default())
+        } else {
+            scan::classify(&policy, &dump)
+        };
         classified.push(Classified {
             dump,
             rule_index,
             journal_context,
+            retained,
         });
     }
 
     let over_cap = scan::compute_keep_count_excess(&policy, &classified);
 
     for (i, c) in classified.iter().enumerate() {
+        if c.retained {
+            println!(
+                "{}\tKEEP\tprocess_name={}\treason=Retained",
+                c.dump.path.display(),
+                c.dump.comm
+            );
+            continue;
+        }
         match c.rule_index {
             None => println!(
                 "{}\tREMOVE\tprocess_name={}\treason=NoRuleMatched",
