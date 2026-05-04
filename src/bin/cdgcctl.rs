@@ -33,7 +33,7 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let config = match Config::load(&args.configuration_file) {
         Ok(c) => c,
