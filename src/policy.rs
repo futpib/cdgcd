@@ -252,13 +252,7 @@ fn glob_min_match_length(pattern: &str) -> usize {
 }
 
 fn resolve_user_name(name: &str) -> Option<u32> {
-    let cstring = std::ffi::CString::new(name).ok()?;
-    let pwd = unsafe { libc::getpwnam(cstring.as_ptr()) };
-    if pwd.is_null() {
-        None
-    } else {
-        Some(unsafe { (*pwd).pw_uid })
-    }
+    users::get_user_by_name(name).map(|u| u.uid())
 }
 
 #[cfg(test)]
